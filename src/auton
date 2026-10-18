@@ -479,6 +479,13 @@ void autonomous() {
     chassis.cancelAllMotions();
     stopDrive();
     chassis.setPose(0, 0, 0);
+    const uint32_t startTime = pros::millis();
+
+    chassis.moveToPoint(0, 10, 1000, {}, false);
+    chassis.turnToHeading(90, 1000, {}, false);
+    liftMotors.move(64);
+    pros::delay(750);
+    liftMotors.move_absolute(liftMotors.get_position(), 30);
 
     AprilTagLocalization = true;
     AprilTagReading = false;
@@ -493,10 +500,11 @@ void autonomous() {
     // These states only cover the red-base approach.
     enum class RedApproachState {
         ACQUIRE_TAG,
+        FALLBACK_FORWARD,
+        FALLBACK_MOVING,
         PLAN_APPROACH,
         MOVING,
-        DONE,
-        FAILED
+        DONE
     };
 
     RedApproachState state = RedApproachState::ACQUIRE_TAG;
@@ -507,7 +515,7 @@ void autonomous() {
 
     // Tracking-center-to-tag clearance.
     // Measure an appropriate value for your robot before running.
-    constexpr double STANDOFF_IN = 1000.0;
+    constexpr double STANDOFF_IN = 7;
 
     // Initial test only: cap the commanded target displacement.
     constexpr double MAX_APPROACH_TRAVEL_IN = 2.0;
@@ -516,8 +524,9 @@ void autonomous() {
 
     double targetX = 0.0;
     double targetY = 0.0;
-
-    const uint32_t startTime = pros::millis();
+    double fallbackTargetX = 0.0;
+    double fallbackTargetY = 0.0;
+    uint32_t acquisitionStartTime = pros::millis();
 
     // ---------- TIMED AUTONOMOUS LOOP ----------
     while (pros::millis() - startTime < TOTAL_TIMEOUT_MS) {
@@ -534,12 +543,60 @@ void autonomous() {
                     printf("Tag 2 acquired. Planning approach.\n");
                     state = RedApproachState::PLAN_APPROACH;
                 }
-                else if (pros::millis() - startTime >=
+                else if (pros::millis() - acquisitionStartTime >=
                          ACQUIRE_TIMEOUT_MS) {
-                    printf("FAILED: No accepted Tag 2 position.\n");
-                    state = RedApproachState::FAILED;
+                    printf("Tag acquisition timed out; moving forward 1 inch.\n");
+                    state = RedApproachState::FALLBACK_FORWARD;
                 }
 
+                break;
+            }
+
+            case RedApproachState::FALLBACK_FORWARD: {
+                AprilTagLocalization = false;
+                resetTagConsist();
+
+                const auto pose = chassis.getPose();
+                const double headingRad = pose.theta * DEG_TO_RAD;
+                fallbackTargetX = pose.x + std::sin(headingRad);
+                fallbackTargetY = pose.y + std::cos(headingRad);
+
+                chassis.moveToPoint(
+                    fallbackTargetX,
+                    fallbackTargetY,
+                    MOTION_TIMEOUT_MS,
+                    {.maxSpeed = 40},
+                    true
+                );
+                state = RedApproachState::FALLBACK_MOVING;
+                break;
+            }
+
+            case RedApproachState::FALLBACK_MOVING: {
+                if (!chassis.isInMotion()) {
+                    const auto pose = chassis.getPose();
+                    const double fallbackError = std::hypot(
+                        fallbackTargetX - pose.x,
+                        fallbackTargetY - pose.y
+                    );
+
+                    if (!std::isfinite(fallbackError) ||
+                        fallbackError > TARGET_TOLERANCE_IN) {
+                        printf(
+                            "Fallback move incomplete; retrying tag acquisition. "
+                            "Odom error: %.2f in\n",
+                            fallbackError
+                        );
+                    }
+
+                    AprilTagLocalization = true;
+                    AprilTagReading = false;
+                    AprilTagCorrectionAccepted = false;
+                    resetTagConsist();
+                    useTagMode();
+                    acquisitionStartTime = pros::millis();
+                    state = RedApproachState::ACQUIRE_TAG;
+                }
                 break;
             }
 
@@ -557,17 +614,25 @@ void autonomous() {
 
                 if (!std::isfinite(distanceToTag) ||
                     distanceToTag <= 0.0) {
-                    printf("FAILED: Invalid tag distance.\n");
-                    state = RedApproachState::FAILED;
+                    printf("Invalid tag distance; reacquiring AprilTag.\n");
+                    redTagMapped = false;
+                    redTagPosition = {};
+                    AprilTagLocalization = true;
+                    AprilTagReading = false;
+                    AprilTagCorrectionAccepted = false;
+                    resetTagConsist();
+                    acquisitionStartTime = pros::millis();
+                    state = RedApproachState::ACQUIRE_TAG;
                     break;
                 }
 
-                if (distanceToTag <= STANDOFF_IN) {
+                if (distanceToTag <=
+                    STANDOFF_IN + TARGET_TOLERANCE_IN) {
                     printf(
-                        "No approach needed: center-to-tag distance "
-                        "%.2f in is within %.2f in clearance.\n",
+                        "Approach complete: center-to-tag distance "
+                        "%.2f in is within %.2f in clearance tolerance.\n",
                         distanceToTag,
-                        STANDOFF_IN
+                        STANDOFF_IN + TARGET_TOLERANCE_IN
                     );
 
                     state = RedApproachState::DONE;
@@ -615,25 +680,49 @@ void autonomous() {
                         targetX - pose.x,
                         targetY - pose.y
                     );
+                    const double remainingTagDistance = std::hypot(
+                        redTagPosition.x - pose.x,
+                        redTagPosition.y - pose.y
+                    );
 
-                    if (std::isfinite(remainingError) &&
-                        remainingError <= TARGET_TOLERANCE_IN) {
+                    if (!std::isfinite(remainingError) ||
+                        !std::isfinite(remainingTagDistance)) {
+                        printf("Invalid odometry after motion; reacquiring AprilTag.\n");
+                        redTagMapped = false;
+                        redTagPosition = {};
+                        AprilTagLocalization = true;
+                        AprilTagReading = false;
+                        AprilTagCorrectionAccepted = false;
+                        resetTagConsist();
+                        acquisitionStartTime = pros::millis();
+                        state = RedApproachState::ACQUIRE_TAG;
+                    }
+                    else if (remainingError <= TARGET_TOLERANCE_IN) {
+                        if (remainingTagDistance <=
+                            STANDOFF_IN + TARGET_TOLERANCE_IN) {
+                            printf(
+                                "Approach complete. Tag clearance: %.2f in\n",
+                                remainingTagDistance
+                            );
+                            state = RedApproachState::DONE;
+                        }
+                        else {
+                            printf(
+                                "Approach step reached; remaining tag distance: "
+                                "%.2f in. Replanning.\n",
+                                remainingTagDistance
+                            );
+                            state = RedApproachState::PLAN_APPROACH;
+                        }
+                    }
+                    else {
                         printf(
-                            "Approach target reached. "
+                            "Approach step incomplete; replanning. "
                             "Odom error: %.2f in\n",
                             remainingError
                         );
 
-                        state = RedApproachState::DONE;
-                    }
-                    else {
-                        printf(
-                            "FAILED: Motion ended without reaching "
-                            "the target. Odom error: %.2f in\n",
-                            remainingError
-                        );
-
-                        state = RedApproachState::FAILED;
+                        state = RedApproachState::PLAN_APPROACH;
                     }
                 }
 
@@ -641,12 +730,10 @@ void autonomous() {
             }
 
             case RedApproachState::DONE:
-            case RedApproachState::FAILED:
                 break;
         }
 
-        if (state == RedApproachState::DONE ||
-            state == RedApproachState::FAILED) {
+        if (state == RedApproachState::DONE) {
             break;
         }
 
@@ -657,13 +744,30 @@ void autonomous() {
     chassis.cancelAllMotions();
     stopDrive();
 
+    if (state == RedApproachState::DONE) {
+        ClawMotor.move(-64);
+        pros::delay(500);
+        ClawMotor.move(0);
+
+        const auto pose = chassis.getPose();
+        const double headingRad = pose.theta * DEG_TO_RAD;
+        const double reverseTargetX = pose.x - 2.0 * std::sin(headingRad);
+        const double reverseTargetY = pose.y - 2.0 * std::cos(headingRad);
+        chassis.moveToPoint(
+            reverseTargetX,
+            reverseTargetY,
+            MOTION_TIMEOUT_MS,
+            {.maxSpeed = 40},
+            false
+        );
+    }
+
     AprilTagLocalization = false;
     AprilTagReading = false;
     AprilTagCorrectionAccepted = false;
     resetTagConsist();
 
-    if (state != RedApproachState::DONE &&
-        state != RedApproachState::FAILED) {
+    if (state != RedApproachState::DONE) {
         printf("STOP: Overall autonomous timeout.\n");
     }
 
