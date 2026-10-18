@@ -51,6 +51,7 @@ pros::AIVision::Color yellowColor = { //yellow color description for the vision 
 
 //Motors
 pros::Motor ClawMotor(3); // Claw motor - port 3
+pros::Motor ToggleMotor(6); // Toggle motor - port 6
 
 // tracking wheels
 // horizontal tracking wheel encoder. Rotation sensor, port 16,
@@ -778,4 +779,43 @@ void autonomous() {
     }
 
     printf("Red-base approach routine ended.\n");
+}
+
+/**
+ * Runs in driver control.
+ */
+void opcontrol() {
+    while (true) {
+        const int dir = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
+        const int turn = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_X);
+        leftMotors.move(dir + turn);
+        rightMotors.move(dir - turn);
+
+        if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1)) {
+            liftMotors.move(64);
+        } else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2)) {
+            liftMotors.move(-64);
+        } else {
+            liftMotors.move_absolute(liftMotors.get_position(), 25);
+        }
+
+        if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1)) {
+            rollerMotors.move(-64);
+        } else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2)) {
+            ToggleMotor.move(127);
+        } else {
+            rollerMotors.move(0);
+            ToggleMotor.move(0);
+        }
+
+        if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_Y)) {
+            ClawMotor.move(34);
+        } else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_A)) {
+            ClawMotor.move(-34);
+        } else {
+            ClawMotor.move(0);
+        }
+
+        pros::delay(20);
+    }
 }
