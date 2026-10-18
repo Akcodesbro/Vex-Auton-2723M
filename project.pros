@@ -1,7 +1,7 @@
 {
   "py/object": "pros.conductor.project.Project",
   "py/state": {
-    "project_name": "drvr",
+    "project_name": "AutoBotAI",
     "target": "v5",
     "templates": {
       "LemLib": {
@@ -657,9 +657,9 @@
       }
     },
     "upload_options": {
-      "description": "Run this!",
-      "icon": "clawbot",
-      "slot": 2
+      "description": "AutoVision",
+      "icon": "robot",
+      "slot": 8
     },
     "use_early_access": false
   }
