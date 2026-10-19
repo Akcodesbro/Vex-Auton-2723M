@@ -14,6 +14,7 @@
 #include "pros/rtos.hpp"
 #include "pros/ai_vision.hpp"
 #include "pros_pose/pros_pose.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -40,11 +41,20 @@ ProsPose tagPoseEstimator(
     0.028575  // Measured tag side: 1.125 inches (real tag is 1.125 inches, but printed is .875 inches)
 );
 
-pros::AIVision::Color yellowColor = { //yellow color description for the vision sensor
-    .id = 1,
+pros::AIVision::Color redColor = {   //color definition for red
+    .id = 2,
     .red = 255,
-    .green = 220,
+    .green = 0,
     .blue = 0,
+    .hue_range = 15,
+    .saturation_range = 0.5
+};
+
+pros::AIVision::Color blueColor = {   //color definition for blue
+    .id = 3,
+    .red = 0,
+    .green = 0,
+    .blue = 255,
     .hue_range = 15,
     .saturation_range = 0.5
 };
@@ -57,7 +67,7 @@ pros::Motor ToggleMotor(6); // Toggle motor - port 6
 // horizontal tracking wheel encoder. Rotation sensor, port 16,
 pros::Rotation horizontalEnc(16);
 // vertical tracking wheel encoder. Rotation sensor, port 17,
-pros::Rotation verticalEnc(17);
+pros::Rotation verticalEnc(15);
 // horizontal tracking wheel. 2" diameter, 0" offset, back of the robot (negative)
 lemlib::TrackingWheel horizontal(&horizontalEnc, lemlib::Omniwheel::NEW_2, 0);
 // vertical tracking wheel. 2" diameter, 2.25" offset, right of the robot (negative)
@@ -136,8 +146,10 @@ constexpr double RED_BASE_X = 23.11; //pos of red base in inches, x is right, y 
 constexpr double RED_BASE_Y = 46.66; //pos of red base in inches, x is right, y is forward
 constexpr double RED_BASE_APPROACH_DISTANCE = 3.0; //distance from the red base to stop at in inches
 
-constexpr double YELLOW_STACK_X = 0.0; //pos of yellow stack in inches, x is right, y is forward
-constexpr double YELLOW_STACK_Y = 46.66; //pos of yellow stack in inches, x is right, y is forward
+constexpr double RED_BLUE_STACK_X = 46.66;
+constexpr double RED_BLUE_STACK_Y = 70.20;
+constexpr double DROP_OFF_BASE_X = 23.11;
+constexpr double DROP_OFF_BASE_Y = 93.75;
 
 constexpr double APPR_HEADING = 90.0; //approach heading for red base in degress
 
@@ -157,8 +169,17 @@ constexpr double METERS_TO_INCHES = 39.37007874015748;
 constexpr double DEG_TO_RAD = 0.017453292519943295;
 
 // Camera position relative to the robot's center.
-constexpr double CAMERA_FORWARD_IN = 1.378;
+constexpr double CAMERA_FORWARD_IN = 6.5;
 constexpr double CAMERA_RIGHT_IN = 7.625;
+constexpr double AUTON_START_FIELD_X = 0.0;
+constexpr double AUTON_START_FIELD_Y = 70.20;
+
+FieldXY fieldToAutonCoordinates(double fieldX, double fieldY) {
+    return {
+        fieldX - AUTON_START_FIELD_X,
+        fieldY - AUTON_START_FIELD_Y
+    };
+}
 
 bool AprilTagLocalization = true; //set a boolean to determine whether to use AprilTag localization or not
 bool AprilTagCorrectionAccepted = false; //set a boolean to determine whether to accept the AprilTag correction or not
@@ -381,7 +402,7 @@ void useTagMode() {
     );
 }
 
-void useYellowMode() {
+void useStackColorMode() {
     AprilTagCorrectionAccepted = false;
     AprilTagReading = false;
     resetTagConsist();
@@ -394,34 +415,40 @@ void useYellowMode() {
     );
 }
 
-void processYellowDetection() {
+struct StackColorTarget {
+    double centerX;
+    int height;
+    int id;
+};
+
+bool findStackColorTarget(StackColorTarget& target) {
     auto detections = vision.get_all_objects();
-    bool foundYellow = false;
+    bool foundTarget = false;
+    double largestArea = 0.0;
+
     for (const auto& detection : detections) {
         if (!pros::AIVision::is_type(
                 detection, pros::AivisionDetectType::color)) {
             continue;
         }
-        if (detection.id != yellowColor.id) {
+        if (detection.id != redColor.id && detection.id != blueColor.id) {
             continue;
         }
-        foundYellow = true;
+
         const auto& box = detection.object.color;
-        const double centerX = box.xoffset + box.width / 2.0;
-        const double centerY = box.yoffset + box.height / 2.0;
-        const double horizontalError = centerX - 160.0;
-        printf(
-            "YELLOW: center=(%.1f, %.1f), width=%d, height=%d, error=%.1f\n",
-            centerX,
-            centerY,
-            static_cast<int>(box.width),
-            static_cast<int>(box.height),
-            horizontalError
-        );
+        const double area = static_cast<double>(box.width) * box.height;
+        if (area > largestArea) {
+            largestArea = area;
+            target = {
+                box.xoffset + box.width / 2.0,
+                static_cast<int>(box.height),
+                detection.id
+            };
+            foundTarget = true;
+        }
     }
-    if (!foundYellow) {
-        printf("Yellow Not Found!");
-    }
+
+    return foundTarget;
 }
 
 /**
@@ -433,9 +460,16 @@ void processYellowDetection() {
 void initialize() {
     pros::lcd::initialize();
     chassis.calibrate();
-
     vision.reset();
-    vision.set_color(yellowColor);
+    const int32_t redColorResult = vision.set_color(redColor);
+    const int32_t blueColorResult = vision.set_color(blueColor);
+    if (redColorResult != PROS_SUCCESS || blueColorResult != PROS_SUCCESS) {
+        printf(
+            "Failed to configure stack colors: red=%d blue=%d\n",
+            redColorResult,
+            blueColorResult
+        );
+    }
     pros::delay(100); // Existing delay; not a verified readiness guarantee.
 
     // Keep this only if your physical tag is from this family.
@@ -462,10 +496,10 @@ ASSET(example_txt); // '.' replaced with "_" to make c++ happy
 enum class AutonPhase { //create an enum class to hold the different phases of the autonomous routine
     DRIVE_TO_RED_BASE,
     FINAL_RED_BASE_APPROACH,
-    FIND_YELLOW_STACK,
-    HANDLE_YELLOW_STACK,
-    RETURN_TO_RED_BASE,
-    FINAL_RETUREN_APPROACH,
+    FIND_RED_BLUE_STACK,
+    HANDLE_RED_BLUE_STACK,
+    DRIVE_TO_DROP_OFF_BASE,
+    FINAL_DROP_OFF_APPROACH,
     DONE
 };
 AutonPhase currentPhase = AutonPhase::DRIVE_TO_RED_BASE; //set the current phase to the first phase of the autonomous routine
@@ -479,10 +513,11 @@ void autonomous() {
     // ---------- STARTUP ----------
     chassis.cancelAllMotions();
     stopDrive();
+    // The autonomous coordinate origin is the marked start at field (0, 70.20).
     chassis.setPose(0, 0, 0);
     const uint32_t startTime = pros::millis();
 
-    chassis.moveToPoint(0, 4, 1000, {}, false);
+    chassis.moveToPoint(0, 9.5, 1000, {}, false);
     chassis.swingToHeading(90, lemlib::DriveSide::RIGHT, 750, {}, false);
     liftMotors.move(64);
     pros::delay(1000);
@@ -504,20 +539,28 @@ void autonomous() {
         FALLBACK_FORWARD,
         FALLBACK_MOVING,
         PLAN_APPROACH,
+        MOVE_TO_TARGET,
         MOVING,
+        ALIGN_CLAW_WITH_RED_BASE,
+        OPEN_RED_BASE,
+        BACK_AWAY_FROM_RED_BASE,
+        CONFIGURE_STACK_VISION,
+        MOVE_TO_STACK,
+        FIND_AND_PICK_UP_STACK,
+        MOVE_TO_DROP_OFF,
+        RELEASE_STACK,
         DONE
     };
 
     RedApproachState state = RedApproachState::ACQUIRE_TAG;
 
-    constexpr uint32_t TOTAL_TIMEOUT_MS = 15000;
     constexpr uint32_t ACQUIRE_TIMEOUT_MS = 4000;
     constexpr int MOTION_TIMEOUT_MS = 2500;
     constexpr int APPROACH_MOTION_TIMEOUT_MS = 4000;
+    constexpr uint32_t TOTAL_TIMEOUT_MS = 15000;
 
-    // Tracking-center-to-tag clearance.
-    // Measure an appropriate value for your robot before running.
-    constexpr double STANDOFF_IN = 7;
+    // The claw contact point is 7.5 inches forward of the tracking center.
+    constexpr double STANDOFF_IN = 7.5;
 
     // Initial test only: cap the commanded target displacement.
     constexpr double MAX_APPROACH_TRAVEL_IN = 3.0;
@@ -526,9 +569,76 @@ void autonomous() {
 
     double targetX = 0.0;
     double targetY = 0.0;
+    bool redBaseAtStandoff = false;
     double fallbackTargetX = 0.0;
     double fallbackTargetY = 0.0;
+    bool stackCollected = false;
+    bool stackDelivered = false;
     uint32_t acquisitionStartTime = pros::millis();
+    //Calculating relative coordinates:
+    const FieldXY stackTarget =
+        fieldToAutonCoordinates(RED_BLUE_STACK_X, RED_BLUE_STACK_Y);
+    const FieldXY dropTarget =
+        fieldToAutonCoordinates(DROP_OFF_BASE_X, DROP_OFF_BASE_Y);
+
+    auto remainingAutonMs = [&]() -> uint32_t {
+        const uint32_t elapsed = pros::millis() - startTime;
+        return elapsed < TOTAL_TIMEOUT_MS ? TOTAL_TIMEOUT_MS - elapsed : 0;
+    };
+
+    auto moveToStandoff = [&](const char* label,
+                              const FieldXY& target,
+                              double standoff) {
+        const uint32_t remaining = remainingAutonMs();
+        if (remaining == 0) {
+            return false;
+        }
+
+        const auto pose = chassis.getPose();
+        const double dx = target.x - pose.x;
+        const double dy = target.y - pose.y;
+        const double distance = std::hypot(dx, dy);
+        if (!std::isfinite(distance) || distance <= standoff) {
+            printf("Cannot plan %s approach from current pose.\n", label);
+            return false;
+        }
+
+        const double approachX = target.x - dx / distance * standoff;
+        const double approachY = target.y - dy / distance * standoff;
+        const int motionTimeout = static_cast<int>(
+            std::min<uint32_t>(8000, remaining)
+        );
+
+        printf(
+            "%s coordinate: field=(%.2f, %.2f), local=(%.2f, %.2f), "
+            "waypoint=(%.2f, %.2f)\n",
+            label,
+            target.x + AUTON_START_FIELD_X,
+            target.y + AUTON_START_FIELD_Y,
+            target.x,
+            target.y,
+            approachX,
+            approachY
+        );
+
+        chassis.cancelAllMotions();
+        stopDrive();
+        chassis.moveToPoint(
+            approachX,
+            approachY,
+            motionTimeout,
+            {.maxSpeed = 40, .minSpeed = 20, .earlyExitRange = 1.0},
+            false
+        );
+
+        const auto finalPose = chassis.getPose();
+        const double waypointError = std::hypot(
+            approachX - finalPose.x,
+            approachY - finalPose.y
+        );
+        printf("%s waypoint odometry error: %.2f in\n", label, waypointError);
+        return std::isfinite(waypointError) && waypointError <= 6.0;
+    };
 
     // ---------- TIMED AUTONOMOUS LOOP ----------
     while (pros::millis() - startTime < TOTAL_TIMEOUT_MS) {
@@ -557,6 +667,11 @@ void autonomous() {
             case RedApproachState::FALLBACK_FORWARD: {
                 AprilTagLocalization = false;
                 resetTagConsist();
+                const uint32_t remaining = remainingAutonMs();
+                if (remaining == 0) {
+                    state = RedApproachState::DONE;
+                    break;
+                }
 
                 const auto pose = chassis.getPose();
                 const double headingRad = pose.theta * DEG_TO_RAD;
@@ -566,7 +681,10 @@ void autonomous() {
                 chassis.moveToPoint(
                     fallbackTargetX,
                     fallbackTargetY,
-                    MOTION_TIMEOUT_MS,
+                    static_cast<int>(std::min<uint32_t>(
+                        MOTION_TIMEOUT_MS,
+                        remaining
+                    )),
                     {.maxSpeed = 40, .minSpeed = 20, .earlyExitRange = 0.1},
                     false
                 );
@@ -628,16 +746,13 @@ void autonomous() {
                     break;
                 }
 
-                if (distanceToTag <=
-                    STANDOFF_IN + TARGET_TOLERANCE_IN) {
+                if (distanceToTag <= STANDOFF_IN) {
                     printf(
-                        "Approach complete: center-to-tag distance "
-                        "%.2f in is within %.2f in clearance tolerance.\n",
-                        distanceToTag,
-                        STANDOFF_IN + TARGET_TOLERANCE_IN
+                        "At claw standoff: center-to-tag distance %.2f in.\n",
+                        distanceToTag
                     );
-
-                    state = RedApproachState::DONE;
+                    redBaseAtStandoff = true;
+                    state = RedApproachState::ALIGN_CLAW_WITH_RED_BASE;
                     break;
                 }
 
@@ -660,20 +775,37 @@ void autonomous() {
                     targetY,
                     travel
                 );
-                printf("Moving from %.2f,%.2f to %.2f,%.2f,pose.x,pose.y, targetX,targetY");
+                printf(
+                    "Moving from (%.2f, %.2f) to (%.2f, %.2f)\n",
+                    pose.x,
+                    pose.y,
+                    targetX,
+                    targetY
+                );
 
+                redBaseAtStandoff = false;
+                state = RedApproachState::ALIGN_CLAW_WITH_RED_BASE;
+                break;
+            }
+
+            case RedApproachState::MOVE_TO_TARGET: {
                 chassis.cancelAllMotions();
                 stopDrive();
-                // Start once. Do not restart this every loop.
-                chassis.moveToPoint(targetX, targetY, 1000, {.maxSpeed = 40, .minSpeed = 30, .earlyExitRange = 0.7}, false);
-                // chassis.moveToPoint(
-                //     targetX,
-                //     targetY,
-                //     APPROACH_MOTION_TIMEOUT_MS,
-                //     {.maxSpeed = 40, .minSpeed = 20, .earlyExitRange = 0.5},
-                //     false
-                // );
-
+                const uint32_t remaining = remainingAutonMs();
+                if (remaining == 0) {
+                    state = RedApproachState::DONE;
+                    break;
+                }
+                chassis.moveToPoint(
+                    targetX,
+                    targetY,
+                    static_cast<int>(std::min<uint32_t>(
+                        APPROACH_MOTION_TIMEOUT_MS,
+                        remaining
+                    )),
+                    {.maxSpeed = 90, .minSpeed = 64, .earlyExitRange = 0.7},
+                    false
+                );
                 state = RedApproachState::MOVING;
                 break;
             }
@@ -705,13 +837,12 @@ void autonomous() {
                         state = RedApproachState::ACQUIRE_TAG;
                     }
                     else if (remainingError <= TARGET_TOLERANCE_IN) {
-                        if (remainingTagDistance <=
-                            STANDOFF_IN + TARGET_TOLERANCE_IN) {
+                        if (remainingTagDistance <= STANDOFF_IN) {
                             printf(
-                                "Approach complete. Tag clearance: %.2f in\n",
+                                "At claw standoff. Tag distance: %.2f in\n",
                                 remainingTagDistance
                             );
-                            state = RedApproachState::DONE;
+                            state = RedApproachState::PLAN_APPROACH;
                         }
                         else {
                             printf(
@@ -736,6 +867,206 @@ void autonomous() {
                 break;
             }
 
+            case RedApproachState::ALIGN_CLAW_WITH_RED_BASE: {
+                AprilTagLocalization = false;
+                resetTagConsist();
+                const uint32_t remaining = remainingAutonMs();
+                if (remaining == 0) {
+                    state = RedApproachState::DONE;
+                    break;
+                }
+
+                chassis.turnToPoint(
+                    redTagPosition.x,
+                    redTagPosition.y,
+                    static_cast<int>(std::min<uint32_t>(1500, remaining)),
+                    {.maxSpeed = 50, .minSpeed = 20, .earlyExitRange = 2.0},
+                    false
+                );
+                state = remainingAutonMs() > 0
+                    ? (redBaseAtStandoff
+                        ? RedApproachState::OPEN_RED_BASE
+                        : RedApproachState::MOVE_TO_TARGET)
+                    : RedApproachState::DONE;
+                break;
+            }
+
+            case RedApproachState::OPEN_RED_BASE: {
+                const uint32_t actionTime =
+                    std::min<uint32_t>(500, remainingAutonMs());
+                if (actionTime == 0) {
+                    state = RedApproachState::DONE;
+                    break;
+                }
+
+                ClawMotor.move(-64);
+                pros::delay(actionTime);
+                ClawMotor.move(0);
+                state = remainingAutonMs() > 0
+                    ? RedApproachState::BACK_AWAY_FROM_RED_BASE
+                    : RedApproachState::DONE;
+                break;
+            }
+
+            case RedApproachState::BACK_AWAY_FROM_RED_BASE: {
+                const uint32_t remaining = remainingAutonMs();
+                if (remaining == 0) {
+                    state = RedApproachState::DONE;
+                    break;
+                }
+
+                const auto pose = chassis.getPose();
+                const double headingRad = pose.theta * DEG_TO_RAD;
+                const double reverseTargetX =
+                    pose.x - 2.0 * std::sin(headingRad);
+                const double reverseTargetY =
+                    pose.y - 2.0 * std::cos(headingRad);
+                chassis.moveToPoint(
+                    reverseTargetX,
+                    reverseTargetY,
+                    static_cast<int>(std::min<uint32_t>(
+                        MOTION_TIMEOUT_MS,
+                        remaining
+                    )),
+                    {.maxSpeed = 40},
+                    false
+                );
+                state = remainingAutonMs() > 0
+                    ? RedApproachState::CONFIGURE_STACK_VISION
+                    : RedApproachState::DONE;
+                break;
+            }
+
+            case RedApproachState::CONFIGURE_STACK_VISION:
+                AprilTagLocalization = false;
+                AprilTagReading = false;
+                AprilTagCorrectionAccepted = false;
+                resetTagConsist();
+                useStackColorMode();
+                state = RedApproachState::MOVE_TO_STACK;
+                break;
+
+            case RedApproachState::MOVE_TO_STACK:
+                if (moveToStandoff("Red/blue stack", stackTarget, 12.0)) {
+                    state = RedApproachState::FIND_AND_PICK_UP_STACK;
+                } else {
+                    printf("STOP: Coordinate approach to red/blue stack failed.\n");
+                    state = RedApproachState::DONE;
+                }
+                break;
+
+            case RedApproachState::FIND_AND_PICK_UP_STACK: {
+                constexpr double STACK_CROSSCHECK_RADIUS_IN = 20.0;
+                constexpr int STACK_GRAB_HEIGHT_PX = 90;
+                if (remainingAutonMs() == 0) {
+                    state = RedApproachState::DONE;
+                    break;
+                }
+
+                StackColorTarget target{};
+                if (!findStackColorTarget(target)) {
+                    stopDrive();
+                    pros::delay(std::min<uint32_t>(20, remainingAutonMs()));
+                    break;
+                }
+
+                const auto pose = chassis.getPose();
+                const double coordinateError = std::hypot(
+                    stackTarget.x - pose.x,
+                    stackTarget.y - pose.y
+                );
+                if (!std::isfinite(coordinateError) ||
+                    coordinateError > STACK_CROSSCHECK_RADIUS_IN) {
+                    stopDrive();
+                    printf(
+                        "Vision target rejected: stack coordinate error "
+                        "%.2f in exceeds %.2f in.\n",
+                        coordinateError,
+                        STACK_CROSSCHECK_RADIUS_IN
+                    );
+                    state = RedApproachState::DONE;
+                    break;
+                }
+
+                if (target.height >= STACK_GRAB_HEIGHT_PX) {
+                    stopDrive();
+                    const uint32_t rollerTime =
+                        std::min<uint32_t>(700, remainingAutonMs());
+                    if (rollerTime == 0) {
+                        state = RedApproachState::DONE;
+                        break;
+                    }
+                    rollerMotors.move(64);
+                    pros::delay(rollerTime);
+                    rollerMotors.move(0);
+
+                    const uint32_t clawTime =
+                        std::min<uint32_t>(500, remainingAutonMs());
+                    if (clawTime == 0) {
+                        state = RedApproachState::DONE;
+                        break;
+                    }
+                    ClawMotor.move(34);
+                    pros::delay(clawTime);
+                    ClawMotor.move(0);
+
+                    stackCollected =
+                        rollerTime == 700 && clawTime == 500;
+                    printf(
+                        "Red/blue stack %s; color id=%d, height=%d px, "
+                        "coordinate error=%.2f in.\n",
+                        stackCollected ? "acquired" : "pickup timed out",
+                        target.id,
+                        target.height,
+                        coordinateError
+                    );
+                    state = stackCollected && remainingAutonMs() > 0
+                        ? RedApproachState::MOVE_TO_DROP_OFF
+                        : RedApproachState::DONE;
+                    break;
+                }
+
+                const double horizontalError = target.centerX - 160.0;
+                const int turn = std::clamp(
+                    static_cast<int>(horizontalError * 0.25),
+                    -20,
+                    20
+                );
+                constexpr int forward = 18;
+                leftMotors.move(forward + turn);
+                rightMotors.move(forward - turn);
+                pros::delay(std::min<uint32_t>(20, remainingAutonMs()));
+                break;
+            }
+
+            case RedApproachState::MOVE_TO_DROP_OFF:
+                if (moveToStandoff("Drop-off base", dropTarget, 7.0)) {
+                    state = RedApproachState::RELEASE_STACK;
+                } else {
+                    printf("STOP: Coordinate approach to drop-off base failed.\n");
+                    state = RedApproachState::DONE;
+                }
+                break;
+
+            case RedApproachState::RELEASE_STACK: {
+                const uint32_t releaseTime =
+                    std::min<uint32_t>(500, remainingAutonMs());
+                if (releaseTime == 0) {
+                    state = RedApproachState::DONE;
+                    break;
+                }
+
+                ClawMotor.move(-64);
+                pros::delay(releaseTime);
+                ClawMotor.move(0);
+                stackDelivered = releaseTime == 500;
+                if (stackDelivered) {
+                    printf("Stack released at the drop-off base.\n");
+                }
+                state = RedApproachState::DONE;
+                break;
+            }
+
             case RedApproachState::DONE:
                 break;
         }
@@ -744,41 +1075,27 @@ void autonomous() {
             break;
         }
 
-        pros::delay(100);
+        pros::delay(std::min<uint32_t>(100, remainingAutonMs()));
     }
 
-    // ---------- ALWAYS STOP BEFORE EXITING ----------
     chassis.cancelAllMotions();
     stopDrive();
-
-    if (state == RedApproachState::DONE) {
-        ClawMotor.move(-64);
-        pros::delay(500);
-        ClawMotor.move(0);
-
-        const auto pose = chassis.getPose();
-        const double headingRad = pose.theta * DEG_TO_RAD;
-        const double reverseTargetX = pose.x - 2.0 * std::sin(headingRad);
-        const double reverseTargetY = pose.y - 2.0 * std::cos(headingRad);
-        chassis.moveToPoint(
-            reverseTargetX,
-            reverseTargetY,
-            MOTION_TIMEOUT_MS,
-            {.maxSpeed = 40},
-            false
-        );
-    }
-
+    rollerMotors.move(0);
+    ToggleMotor.move(0);
+    ClawMotor.move(0);
     AprilTagLocalization = false;
     AprilTagReading = false;
     AprilTagCorrectionAccepted = false;
     resetTagConsist();
 
-    if (state != RedApproachState::DONE) {
+    if (pros::millis() - startTime >= TOTAL_TIMEOUT_MS) {
         printf("STOP: Overall autonomous timeout.\n");
     }
 
-    printf("Red-base approach routine ended.\n");
+    if (stackCollected && stackDelivered) {
+        printf("Autonomous route completed and delivered the stack.\n");
+    }
+    printf("Autonomous sequence ended.\n");
 }
 
 /**

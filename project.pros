@@ -658,8 +658,8 @@
     },
     "upload_options": {
       "description": "AutoVision",
-      "icon": "robot",
-      "slot": 8
+      "icon": "planet",
+      "slot": 7
     },
     "use_early_access": false
   }
