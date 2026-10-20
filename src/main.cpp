@@ -1069,9 +1069,26 @@ void autonomous() {
                         MOTION_TIMEOUT_MS,
                         remaining
                     )),
-                    {.maxSpeed = 40},
+                    {.forwards=false, .maxSpeed = 40},
                     false
                 );
+                
+                if (headingRad>180) {
+                    chassis.turnToHeading(headingRad-180, 750, {}, false);
+                }
+                else if (headingRad<180) {
+                    chassis.turnToHeading(headingRad+180, 750, {}, false);
+                }
+                else {
+                    chassis.turnToHeading(0, 750, {}, false);
+                }
+                
+                liftMotors.move(-64);
+                pros::delay(1000);
+                liftMotors.move(0);
+                ClawMotor.move(64);
+                pros::delay(350);
+                ClawMotor.move(0);
                 state = remainingAutonMs() > 0
                     ? RedApproachState::CONFIGURE_STACK_VISION
                     : RedApproachState::DONE;
