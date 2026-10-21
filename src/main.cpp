@@ -134,7 +134,7 @@ struct FieldXY {
 };
 
 
-constexpr double DISTANCE_SENSOR_OFFSET = 2.0; //distance from the front of the robot to the tracking center
+constexpr double DISTANCE_SENSOR_OFFSET = 4.5; //distance from the front of the robot to the tracking center
 
 
 // ID 2 was shown in your earlier Brain photo.
@@ -179,15 +179,16 @@ constexpr double AUTON_START_FIELD_Y = 70.20;
 // the whole way in. dockByDistance() drives forward slowly and stops at a fixed sensor
 // gap, giving a repeatable final stop regardless of how the odometry has drifted.
 constexpr double MM_PER_INCH = 25.4;            // sensor reports mm; targets use inches
-constexpr double RED_BASE_DOCK_DIST_IN = 3.0;   // final sensor->object gap at the red base
+constexpr double RED_BASE_DOCK_DIST_IN = 1.125;   // final sensor->object gap at the red base
 constexpr double STACK_DOCK_DIST_IN = 3.0;      // final sensor->object gap at the red/blue stack
 constexpr double DROP_OFF_DOCK_DIST_IN = 3.0;   // final sensor->object gap at the drop-off base
 constexpr double DOCK_TOLERANCE_IN = 0.15;      // stop once within this of the target gap
 constexpr int DOCK_CRAWL_SPEED = 12;            // 0-127: slow + smooth for a precise stop
-constexpr int DOCK_FACE_SPEED = 20;             // 0-127: gentle final facing turn
-constexpr double DOCK_FACE_TURN_DEG = 8.0;      // skip the facing turn if already within this
+constexpr int DOCK_FACE_SPEED = 28;             // 0-127: maximum final facing-turn speed
+constexpr double DOCK_FACE_TURN_DEG = 2.0;      // skip the facing turn if already within this
+constexpr double DOCK_FACE_TOLERANCE_DEG = 3.0; // require accurate alignment before crawling
 constexpr double DOCK_MAX_TRAVEL_IN = 14.0;     // hard safety cap on total forward crawl
-constexpr int DOCK_MAX_FACE_MS = 1000;          // max time for the facing turn
+constexpr int DOCK_MAX_FACE_MS = 1500;          // max time for the facing turn
 constexpr int DOCK_MAX_CRAWL_MS = 2000;         // max time for the forward crawl
 // --------------------------------------------------------------------------------------------
 
@@ -512,8 +513,8 @@ bool dockByDistance(const char* label,
         return false;
     }
 
-    // 1) Face the object so the front sensor can see it. Skip the turn if we are
-    //    already lined up -- the distance sensor handles the fine forward stop.
+    // 1) Face the object so the front sensor can see it. Do not crawl unless
+    //    this turn finishes accurately; a distance reading cannot correct yaw.
     const auto facePose = chassis.getPose();
     const double targetHeadingDeg =
         std::atan2(targetX - facePose.x, targetY - facePose.y) / DEG_TO_RAD;
@@ -525,8 +526,8 @@ bool dockByDistance(const char* label,
                 targetX, targetY, faceMs,
                 {
                     .maxSpeed = DOCK_FACE_SPEED,
-                    .minSpeed = DOCK_FACE_SPEED,
-                    .earlyExitRange = 2.0
+                    .minSpeed = 8,
+                    .earlyExitRange = 1.0
                 },
                 false
             );
@@ -534,6 +535,18 @@ bool dockByDistance(const char* label,
     }
     stopDrive();
     if (timeLeft() == 0) {
+        return false;
+    }
+    const auto alignedPose = chassis.getPose();
+    const double headingError =
+        std::fabs(wrapDeg(targetHeadingDeg, alignedPose.theta));
+    if (!std::isfinite(headingError) ||
+        headingError > DOCK_FACE_TOLERANCE_DEG) {
+        printf(
+            "%s dock: not aligned; heading error %.1f deg, skipping crawl.\n",
+            label,
+            headingError
+        );
         return false;
     }
 
@@ -635,10 +648,10 @@ void autonomous() {
     chassis.setPose(0, 0, 0);
     const uint32_t startTime = pros::millis();
 
-    chassis.moveToPoint(0, 9.5, 1000, {}, false);
+    chassis.moveToPoint(0, 8, 1000, {}, false);
     chassis.swingToHeading(90, lemlib::DriveSide::RIGHT, 750, {}, false);
     liftMotors.move(64);
-    pros::delay(1000);
+    pros::delay(900);
     liftMotors.move_absolute(liftMotors.get_position(), 30);
 
     AprilTagLocalization = true;
@@ -1007,7 +1020,7 @@ void autonomous() {
                     redTagPosition.x,
                     redTagPosition.y,
                     static_cast<int>(std::min<uint32_t>(1500, remaining)),
-                    {.maxSpeed = 50, .minSpeed = 20, .earlyExitRange = 2.0},
+                    {.maxSpeed = 30, .minSpeed = 8, .earlyExitRange = 1.0},
                     false
                 );
                 state = remainingAutonMs() > 0
@@ -1021,14 +1034,16 @@ void autonomous() {
             case RedApproachState::FINAL_RED_BASE_DOCK: {
                 // Final, repeatable stop at the red base using the front-center
                 // distance sensor: face the base, then crawl to its target gap.
-                dockByDistance(
+                const bool docked = dockByDistance(
                     "red base",
                     redTagPosition.x, redTagPosition.y,
                     RED_BASE_DOCK_DIST_IN,
                     DOCK_TOLERANCE_IN,
                     remainingAutonMs()
                 );
-                state = RedApproachState::OPEN_RED_BASE;
+                state = docked
+                    ? RedApproachState::OPEN_RED_BASE
+                    : RedApproachState::DONE;
                 break;
             }
 
@@ -1039,7 +1054,9 @@ void autonomous() {
                     state = RedApproachState::DONE;
                     break;
                 }
-
+                liftMotors.move(-10);
+                pros::delay(100);
+                liftMotors.move(0);
                 ClawMotor.move(-64);
                 pros::delay(actionTime);
                 ClawMotor.move(0);
@@ -1057,31 +1074,23 @@ void autonomous() {
                 }
 
                 const auto pose = chassis.getPose();
-                const double headingRad = pose.theta * DEG_TO_RAD;
-                const double reverseTargetX =
-                    pose.x - 2.0 * std::sin(headingRad);
-                const double reverseTargetY =
-                    pose.y - 2.0 * std::cos(headingRad);
+                //const double headingRad = pose.theta * DEG_TO_RAD;
+                //const double reverseTargetX =
+                //    pose.x - 5.0 * std::sin(headingRad);
+                //const double reverseTargetY =
+                //    pose.y - 5.0 * std::cos(headingRad);
                 chassis.moveToPoint(
-                    reverseTargetX,
-                    reverseTargetY,
+                    pose.x-21,
+                    pose.y,
                     static_cast<int>(std::min<uint32_t>(
                         MOTION_TIMEOUT_MS,
                         remaining
                     )),
-                    {.forwards=false, .maxSpeed = 40},
+                    {.maxSpeed = 84},
                     false
                 );
                 
-                if (headingRad>180) {
-                    chassis.turnToHeading(headingRad-180, 750, {}, false);
-                }
-                else if (headingRad<180) {
-                    chassis.turnToHeading(headingRad+180, 750, {}, false);
-                }
-                else {
-                    chassis.turnToHeading(0, 750, {}, false);
-                }
+                chassis.turnToHeading(0, 750, {}, false);
                 
                 liftMotors.move(-64);
                 pros::delay(1000);
