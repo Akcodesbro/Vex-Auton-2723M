@@ -189,6 +189,9 @@ constexpr double DOCK_MAX_TRAVEL_IN = 14.0;     // hard safety cap on total forw
 constexpr int DOCK_MAX_FACE_MS = 1500;          // max time for the facing turn
 constexpr int DOCK_MAX_CRAWL_MS = 2000;         // max time for the forward crawl
 constexpr int RED_BASE_DOCK_MAX_CRAWL_MS = 4000;
+constexpr int STACK_VISION_SEARCH_SPEED = 40;
+constexpr double STACK_VISION_SEARCH_MAX_TRAVEL_IN = 12.0;
+constexpr int32_t STACK_SEARCH_STOP_DIST_MM = 80;
 // --------------------------------------------------------------------------------------------
 
 FieldXY fieldToAutonCoordinates(double fieldX, double fieldY) {
@@ -444,12 +447,26 @@ struct StackColorTarget {
     double centerX;
     int height;
     int id;
+    bool hasBothPinColors;
 };
 
 bool findStackColorTarget(StackColorTarget& target) {
+    struct ColorBounds {
+        double left;
+        double right;
+        int top;
+        int bottom;
+        double area;
+        int id;
+    };
+
     auto detections = vision.get_all_objects();
     bool foundTarget = false;
     double largestArea = 0.0;
+    bool foundRed = false;
+    bool foundBlue = false;
+    ColorBounds redBounds{};
+    ColorBounds blueBounds{};
 
     for (const auto& detection : detections) {
         if (!pros::AIVision::is_type(
@@ -462,12 +479,58 @@ bool findStackColorTarget(StackColorTarget& target) {
 
         const auto& box = detection.object.color;
         const double area = static_cast<double>(box.width) * box.height;
+        const ColorBounds bounds{
+            static_cast<double>(box.xoffset),
+            static_cast<double>(box.xoffset + box.width),
+            static_cast<int>(box.yoffset),
+            static_cast<int>(box.yoffset + box.height),
+            area,
+            detection.id
+        };
+
+        if (detection.id == redColor.id && (!foundRed || area > redBounds.area)) {
+            redBounds = bounds;
+            foundRed = true;
+        }
+        if (detection.id == blueColor.id && (!foundBlue || area > blueBounds.area)) {
+            blueBounds = bounds;
+            foundBlue = true;
+        }
+
         if (area > largestArea) {
             largestArea = area;
             target = {
                 box.xoffset + box.width / 2.0,
                 static_cast<int>(box.height),
-                detection.id
+                detection.id,
+                false
+            };
+            foundTarget = true;
+        }
+    }
+
+    if (foundRed && foundBlue) {
+        constexpr double MAX_PIN_HALF_CENTER_OFFSET_PX = 45.0;
+        constexpr int MAX_PIN_HALF_VERTICAL_GAP_PX = 30;
+        const double redCenterX = (redBounds.left + redBounds.right) / 2.0;
+        const double blueCenterX = (blueBounds.left + blueBounds.right) / 2.0;
+        const int verticalGap = std::max(
+            0,
+            std::max(redBounds.top, blueBounds.top) -
+                std::min(redBounds.bottom, blueBounds.bottom)
+        );
+
+        if (std::fabs(redCenterX - blueCenterX) <= MAX_PIN_HALF_CENTER_OFFSET_PX &&
+            verticalGap <= MAX_PIN_HALF_VERTICAL_GAP_PX) {
+            const double left = std::min(redBounds.left, blueBounds.left);
+            const double right = std::max(redBounds.right, blueBounds.right);
+            const int top = std::min(redBounds.top, blueBounds.top);
+            const int bottom = std::max(redBounds.bottom, blueBounds.bottom);
+            target = {
+                (left + right) / 2.0,
+                bottom - top,
+                0,
+                true
             };
             foundTarget = true;
         }
@@ -668,7 +731,7 @@ void autonomous() {
     chassis.moveToPoint(0, 10, 1000, {}, false);
     chassis.swingToHeading(90, lemlib::DriveSide::RIGHT, 750, {}, false);
     liftMotors.move(64);
-    pros::delay(900);
+    pros::delay(700);
     liftMotors.move_absolute(liftMotors.get_position(), 30);
  //   const auto newPose = chassis.getPose();
  //   chassis.moveToPoint(-0.5, newPose.y, 750, {.forwards=false}, false);
@@ -712,7 +775,7 @@ void autonomous() {
 
     // The claw contact point is 7.5 inches forward of the tracking center.
     constexpr double STANDOFF_IN = 7.5;
-    constexpr int RED_BASE_APPROACH_SPEED = 50;
+    constexpr int RED_BASE_APPROACH_SPEED = 70;
     constexpr double RED_BASE_HEADING_KP = 1.0;
     constexpr int RED_BASE_MAX_HEADING_CORRECTION = 12;
 
@@ -721,6 +784,8 @@ void autonomous() {
     double redBaseApproachHeadingDeg = 0.0;
     double fallbackTargetX = 0.0;
     double fallbackTargetY = 0.0;
+    FieldXY stackVisionSearchStart{};
+    double stackVisionSearchHeadingDeg = 0.0;
     bool stackCollected = false;
     bool stackDelivered = false;
     uint32_t acquisitionStartTime = pros::millis();
@@ -1076,9 +1141,10 @@ void autonomous() {
                     {.forwards=false, .maxSpeed = 84},
                     false
                 );
-                
-                chassis.turnToHeading(0, 750, {}, false);
-                
+                const auto newpose = chassis.getPose();
+                chassis.turnToHeading(0, 750, {});
+                chassis.moveToPoint(newpose.x, newpose.y+5, 750, {});
+
                 liftMotors.move(-64);
                 pros::delay(1000);
                 liftMotors.move(0);
@@ -1097,12 +1163,18 @@ void autonomous() {
                 AprilTagCorrectionAccepted = false;
                 resetTagConsist();
                 useStackColorMode();
+                {
+                    const auto pose = chassis.getPose();
+                    stackVisionSearchStart = {pose.x, pose.y};
+                    stackVisionSearchHeadingDeg = pose.theta;
+                }
                 // Find and approach the stack from the live camera image, not
                 // from a hard-coded field coordinate.
                 state = RedApproachState::FIND_AND_PICK_UP_STACK;
                 break;
 
             case RedApproachState::FIND_AND_PICK_UP_STACK: {
+                printf("Finding Stack");
                 constexpr int STACK_GRAB_HEIGHT_PX = 90;
                 constexpr double STACK_CENTER_TOLERANCE_PX = 18.0;
                 if (remainingAutonMs() == 0) {
@@ -1112,14 +1184,48 @@ void autonomous() {
 
                 StackColorTarget target{};
                 if (!findStackColorTarget(target)) {
-                    stopDrive();
+                    printf("Stack not found creeping forward.");
+                    const auto pose = chassis.getPose();
+                    const double traveledIn = std::hypot(
+                        pose.x - stackVisionSearchStart.x,
+                        pose.y - stackVisionSearchStart.y
+                    );
+                    const int32_t distanceMm = dist.get();
+                    if (!std::isfinite(traveledIn) ||
+                        traveledIn >= STACK_VISION_SEARCH_MAX_TRAVEL_IN) {
+                        stopDrive();
+                        printf(
+                            "Stack vision search stopped after %.2f in; "
+                            "no color target detected.\n",
+                            traveledIn
+                        );
+                        state = RedApproachState::DONE;
+                        break;
+                    }
+                    if (distanceMm > 1 &&
+                        distanceMm < STACK_SEARCH_STOP_DIST_MM) {
+                        stopDrive();
+                        pros::delay(std::min<uint32_t>(20, remainingAutonMs()));
+                        break;
+                    }
+
+                    const double headingError =
+                        wrapDeg(stackVisionSearchHeadingDeg, pose.theta);
+                    const int correction = std::clamp(
+                        static_cast<int>(headingError * RED_BASE_HEADING_KP),
+                        -RED_BASE_MAX_HEADING_CORRECTION,
+                        RED_BASE_MAX_HEADING_CORRECTION
+                    );
+                    leftMotors.move(STACK_VISION_SEARCH_SPEED + correction);
+                    rightMotors.move(STACK_VISION_SEARCH_SPEED - correction);
                     pros::delay(std::min<uint32_t>(20, remainingAutonMs()));
                     break;
                 }
 
                 const double horizontalError = target.centerX - 160.0;
 
-                if (target.height >= STACK_GRAB_HEIGHT_PX &&
+                if (target.hasBothPinColors &&
+                    target.height >= STACK_GRAB_HEIGHT_PX &&
                     std::fabs(horizontalError) <= STACK_CENTER_TOLERANCE_PX) {
                     stopDrive();
                     const uint32_t rollerTime =
@@ -1145,10 +1251,10 @@ void autonomous() {
                     stackCollected =
                         rollerTime == 700 && clawTime == 500;
                     printf(
-                        "Red/blue stack %s; color id=%d, height=%d px, "
+                        "Red/blue pin %s; both colors=%d, height=%d px, "
                         "center error=%.1f px.\n",
                         stackCollected ? "acquired" : "pickup timed out",
-                        target.id,
+                        target.hasBothPinColors,
                         target.height,
                         horizontalError
                     );
